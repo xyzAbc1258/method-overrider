@@ -13,21 +13,12 @@ class MethodOverriderImpl(val c: whitebox.Context) {
   }
   private case class Context(aType: Type, actualType: Type, valueIdent: Tree) {
     def inContext(typ: Type): Type = {
-      val res1 = typ.finalResultType.asSeenFrom(actualType, aType.typeSymbol).dealias
-      val res2 = res1.map {
-        case TypeRef(ThisType(n), s, a) if n == aType.typeSymbol =>
-          c.internal.typeRef(actualType, s, a)
-        case x => x
-      }
-      res2
+      typ.finalResultType.asSeenFrom(actualType, aType.typeSymbol).dealias
     }
   }
 
   private implicit class TypeUtils(val typ: Type) {
-    def inContext(implicit ctx: Context): Type = {
-      val res = ctx.inContext(typ)
-      res
-    }
+    def inContext(implicit ctx: Context): Type = ctx.inContext(typ)
   }
 
   private def error(msg: String): Nothing = {
@@ -46,38 +37,42 @@ class MethodOverriderImpl(val c: whitebox.Context) {
   def withOverrides[A: c.WeakTypeTag](original: Expr[A])(overrides: Expr[Overrides[A]]): Expr[A] = {
     val aTag = implicitly[WeakTypeTag[A]].tpe.dealias
     ensureSupportsType(aTag.typeSymbol)
-    val methodsImpls = analyzeOverrides(overrides.tree)
-    val stableType = getStableType(original)
-    implicit val ctx: Context = Context(
-      aTag,
-      stableType,
-      q"this.__proxy"
-    )
-    val allImpls = buildMethodImpls(methodsImpls)
-    val tree =
-      q"""
-          new $aTag with io.overrider.Proxy[$aTag] {
-            val __proxy: ${original.actualType} = $original
-            ..$allImpls
-          }
-     """
-    //info(show(tree) + "\n\n\n" + showRaw(tree))
-    c.Expr[A](tree)
+    val generated = original.actualType match {
+      case SingleType(_, _) => withOverridesStable[A](original)(overrides)
+      case _                => withWrapperOverrides[A](original)(overrides)
+    }
+    info(show(generated))
+    c.Expr(generated)
   }
 
-  private def getStableType(original: c.universe.Expr[_]) = {
-    original.actualType match {
-      case x @ SingleType(_, _) => x
-      case _ =>
-        val fullProxyType = buildProxyType(original)
-        val proxyField = fullProxyType.member(TermName("__proxy"))
-        c.internal.singleType(
-          c.internal.thisType(
-            c.internal.refinedType(List(fullProxyType, original.staticType), NoSymbol).typeSymbol
-          ),
-          proxyField
-        )
-    }
+  private def withWrapperOverrides[A: c.WeakTypeTag](original: Expr[A])(overrides: Expr[Overrides[A]]): Tree = {
+    val aTag = implicitly[WeakTypeTag[A]].tpe.dealias
+    val className = TypeName(c.freshName())
+    val t =
+      q""" {
+       class $className {
+         final val __value: ${original.actualType} = $original
+         val i = io.overrider.MethodOverrider.withOverrides[$aTag](this.__value: this.__value.type)($overrides)
+       }
+       (new $className).i
+       }"""
+    c.typecheck(t) //Typecheck expands macro
+  }
+
+  private def withOverridesStable[A: c.WeakTypeTag](original: Expr[A])(overrides: Expr[Overrides[A]]): Tree = {
+    val aTag = implicitly[WeakTypeTag[A]].tpe.dealias
+    ensureSupportsType(aTag.typeSymbol)
+    val methodsOverrides = analyzeOverrides(overrides.tree)
+    implicit val ctx: Context = Context(
+      aTag,
+      original.actualType,
+      q"self.__proxy"
+    )
+    val allImplementations = buildMethodImplementations(methodsOverrides)
+    q"""new $aTag { self =>
+            final val __proxy: ${original.actualType} = $original
+            ..$allImplementations
+          }"""
   }
 
   private def ensureSupportsType(aTagSymbol: Symbol): Unit = {
@@ -86,21 +81,14 @@ class MethodOverriderImpl(val c: whitebox.Context) {
     }
   }
 
-  private def buildProxyType(original: Expr[_]) = {
-    val abstractProxyType = typeOf[Proxy[_]].typeConstructor
-    appliedType(abstractProxyType, original.actualType)
-  }
-
-  private def buildMethodImpls(impls: List[Target[Name]])(implicit context: Context) = {
+  private def buildMethodImplementations(overrides: List[Target[Name]])(implicit context: Context) = {
     for {
-      member <- context.aType.members if member.isAbstract || impls.exists(_.member == member.name)
+      member <- context.aType.members.toList.sortBy(x => !x.isType)
+      if member.isAbstract || overrides.exists(_.member == member.name)
     } yield {
-      impls.find(_.member == member.name) match {
+      overrides.find(_.member == member.name) match {
         case Some(target) => buildMemberImpl(target.withMember(member))
-        case None =>
-          buildMemberImpl(
-            Target(member, EmptyTree, Select(context.valueIdent, member))
-          )
+        case None         => buildMemberImpl(Target(member, EmptyTree, Select(context.valueIdent, member)))
       }
     }
   }
@@ -109,10 +97,11 @@ class MethodOverriderImpl(val c: whitebox.Context) {
     if (target.member.isMethod) {
       val as = target.member.asMethod
       val returnTT = TypeTree(as.returnType.inContext)
+      val implementation = target.impl
       if (as.isVal) {
-        q"""lazy val ${as.name}: $returnTT = ${target.impl}"""
+        q"""lazy val ${as.name}: $returnTT = $implementation"""
       } else if (as.isVar) {
-        q"""var ${as.name}: $returnTT = ${target.impl}"""
+        q"""var ${as.name}: $returnTT = $implementation"""
       } else {
         buildMethodImpl(target.withMember(as))
       }
@@ -144,8 +133,8 @@ class MethodOverriderImpl(val c: whitebox.Context) {
       val withParams =
         target.member.paramLists.map(_.map(paramSymbolToValDef(_, TypeTree(_))))
       val paramIdents = withParams.map(_.map(x => Ident(x.name)))
-      val tree = simplify(q"""${target.impl}(...$paramIdents)""")._1
-      q"""def ${target.member.name}(...$withParams): $returnTT = $tree"""
+      val targetImpl = simplify(q"""${target.impl}(...$paramIdents)""")._1
+      q"""def ${target.member.name}(...$withParams): $returnTT = $targetImpl"""
     }
   }
 
@@ -160,17 +149,14 @@ class MethodOverriderImpl(val c: whitebox.Context) {
   }
 
   private def typeToTypeTree(baseType: Type, toReplace: mutable.AnyRefMap[AnyRef, Tree]): Tree = {
-    val res = baseType match {
+    baseType match {
       case TypeRef(NoPrefix, h, args) if args.nonEmpty =>
         val nh = symbolToTypeTree(h, toReplace)
         val na = args.map(typeToTypeTree(_, toReplace))
         AppliedTypeTree(nh, na)
-      case TypeRef(NoPrefix, h, _) =>
-        symbolToTypeTree(h, toReplace)
-      case x =>
-        symbolToTypeTree(x.typeSymbol, toReplace)
+      case TypeRef(NoPrefix, h, _) => symbolToTypeTree(h, toReplace)
+      case x                       => symbolToTypeTree(x.typeSymbol, toReplace)
     }
-    res
   }
 
   private def symbolToTypeTree(baseType: Symbol, toReplace: mutable.AnyRefMap[AnyRef, Tree]): Tree = {
@@ -192,9 +178,8 @@ class MethodOverriderImpl(val c: whitebox.Context) {
     val returnTT = transformType(method.returnType.inContext)
     val typeParamNames = typeParamDefs.map(_.name.toTypeName)
     val paramIdents = params.map(_.map(_.name))
-    q"""
-       def ${method.name}[..$typeParamDefs](...$params): $returnTT = ${target.impl}[..$typeParamNames](...$paramIdents)
-     """
+    val targetInvocation = q"""${target.impl}[..$typeParamNames](...$paramIdents)"""
+    q"""def ${method.name}[..$typeParamDefs](...$params): $returnTT = $targetInvocation"""
   }
 
   @tailrec

@@ -81,8 +81,8 @@ class OverriderGenericTraitSpec extends AnyFreeSpec with Matchers {
 
   val wa1: WithAliasIntOption = MethodOverrider.withOverrides[WithAlias](WithAlias)(Overrides[WithAlias])
 
-  //val withAliasAliased: WithAlias = WithAlias
-  //val wa2 = MethodOverrider.withOverrides[WithAlias](withAliasAliased)(Overrides[WithAlias])
+  val withAliasAliased: WithAlias = WithAlias
+  val wa2 = MethodOverrider.withOverrides[WithAlias](withAliasAliased)(Overrides[WithAlias])
 
   "Overrides" - {
     "properly overrides methods which refers trait type param" in {
@@ -114,10 +114,9 @@ class OverriderGenericTraitSpec extends AnyFreeSpec with Matchers {
       wa1.traverse(List(Some(1), None)) mustBe None
     }
 
-    //WIP
-    //"properly delegates methods based on type aliases abstract types" in {
-    //  wa2.wrap(wa2.value) mustBe Some(wa2.value)
-    //  wa2.extract(wa2.wrap(wa2.value)) mustBe wa2.value
-    //}
+    "properly delegates methods based on type aliases abstract types" in {
+      wa2.wrap(wa2.value) mustBe Some(wa2.value)
+      wa2.extract(wa2.wrap(wa2.value)) mustBe wa2.value
+    }
   }
 }

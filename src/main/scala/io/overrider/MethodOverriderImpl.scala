@@ -149,20 +149,25 @@ class MethodOverriderImpl(val c: whitebox.Context) {
   }
 
   private def typeToTypeTree(baseType: Type, toReplace: mutable.AnyRefMap[AnyRef, Tree]): Tree = {
-    baseType match {
+    baseType.dealias match {
       case TypeRef(NoPrefix, h, args) if args.nonEmpty =>
         val nh = symbolToTypeTree(h, toReplace)
         val na = args.map(typeToTypeTree(_, toReplace))
         AppliedTypeTree(nh, na)
       case TypeRef(NoPrefix, h, _) => symbolToTypeTree(h, toReplace)
-      case x                       => symbolToTypeTree(x.typeSymbol, toReplace)
+      case x if x.typeArgs.nonEmpty =>
+        AppliedTypeTree(
+          typeToTypeTree(x.typeConstructor, toReplace),
+          x.typeArgs.map(typeToTypeTree(_, toReplace))
+        )
+      case x => symbolToTypeTree(x.typeSymbol, toReplace)
     }
   }
 
   private def symbolToTypeTree(baseType: Symbol, toReplace: mutable.AnyRefMap[AnyRef, Tree]): Tree = {
     baseType match {
       case m if toReplace.contains(m) => toReplace(m)
-      case x: TypeSymbol              => TypeTree(x.toType)
+      case x: TypeSymbol              => Ident(x)
       case x                          => error(s"Don't know what to do with ${showRaw(x)}")
     }
   }
